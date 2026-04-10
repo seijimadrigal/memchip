@@ -419,9 +419,11 @@ async def _find_duplicate(
         for row in recent_results:
             sim = 1.0 - row.distance
             if sim >= 0.70:
-                return ("duplicate", row.id, sim)
+                mem_obj = (await db.execute(select(Memory).where(Memory.id == row.id))).scalar_one_or_none()
+                return ("duplicate", mem_obj, sim)
             elif sim >= 0.60:
-                return ("near_duplicate", row.id, sim)
+                mem_obj = (await db.execute(select(Memory).where(Memory.id == row.id))).scalar_one_or_none()
+                return ("near_duplicate", mem_obj, sim)
 
         # Check older memories
         older_vec_stmt = (
@@ -436,9 +438,11 @@ async def _find_duplicate(
         for row in older_results:
             sim = 1.0 - row.distance
             if sim >= 0.70:
-                return ("duplicate", row.id, sim)
+                mem_obj = (await db.execute(select(Memory).where(Memory.id == row.id))).scalar_one_or_none()
+                return ("duplicate", mem_obj, sim)
             elif sim >= 0.60:
-                return ("near_duplicate", row.id, sim)
+                mem_obj = (await db.execute(select(Memory).where(Memory.id == row.id))).scalar_one_or_none()
+                return ("near_duplicate", mem_obj, sim)
 
     return ("new", None, None)
 
