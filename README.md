@@ -13,7 +13,7 @@ AI agents forget everything between sessions. Context windows overflow. RAG retr
 - **Automatic extraction** — Drop in raw text, get back structured triples, summaries, temporal events, and user profiles. Five parallel LLM calls extract everything meaningful.
 - **Multi-agent collaboration** — Shared memory pools with ACL-based access control. Agent A stores a deployment note, Agent B finds it instantly. Projects and tasks scope memories automatically.
 - **Conflict-aware** — When "user's favorite color is blue" meets "user now prefers green", Memcloud detects the conflict, supersedes the old memory, and keeps full history.
-- **Framework-agnostic** — REST API + Python SDK + TypeScript SDK + LangChain adapter + MCP server + OpenClaw plugin. Plug into anything.
+- **Framework-agnostic** — REST API + Python SDK + TypeScript SDK + LangChain adapter + MCP server + OpenClaw plugin + Tilly agent harness. Plug into anything.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ Agent → POST /v1/recall → Hybrid Search → Reranking → Context Assembly �
      + pgvector          (768-dim)
 ```
 
-**Search pipeline:**
+**Search pipeline** (accessed via **`POST /v1/recall`** — the primary endpoint for agent context):
 1. **BM25** — PostgreSQL full-text search with GIN index
 2. **pgvector** — Semantic similarity via `nomic-embed-text-v1.5` (768-dim, local, free)
 3. **Knowledge graph** — 2-hop BFS walk across entity relations
@@ -221,6 +221,34 @@ Add to `~/.claude/mcp.json`:
 ```
 
 Tools: `memory_store`, `memory_search`, `memory_answer`, `memory_list`, `memory_delete`
+
+### Tilly (macOS Agent Harness)
+
+```swift
+import TillyStorage
+
+// Enable Memcloud sync in your Tilly agent
+memoryService.enableMemcloud(
+    apiKey: "mc_your_key",
+    apiURL: "https://api.memcloud.dev/v1"
+)
+
+// Memories auto-sync in background. Use tools:
+// - memcloud_recall: pre-assembled context from cloud
+// - memcloud_consolidate: merge duplicates (dream mode)
+// - memcloud_suggest_skills: detect patterns, suggest skills
+```
+
+Tilly integration includes 9 built-in features:
+- **Memory Provenance** — tracks source tool, session, agent role
+- **Privacy Filter** — auto-detects secrets, blocks from cloud sync
+- **Semantic Dedup** — prevents duplicate entries on sync
+- **Cross-Session Continuity** — auto-summarize sessions, recall on start
+- **Auto-Recall** — cloud context cached in system prompt
+- **Memory-Guided Planning** — past lessons injected into plan_task
+- **Sub-Agent Collaboration** — delegate_task results stored with provenance
+- **Dream Mode** — consolidate duplicates and contradictions
+- **Skill Suggestions** — detect repeated patterns, suggest reusable skills
 
 ## API Reference
 
