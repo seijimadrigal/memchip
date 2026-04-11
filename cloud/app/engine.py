@@ -1212,12 +1212,14 @@ async def search_memories(
     results = {}  # content -> result dict
 
     # 1. PostgreSQL FTS (BM25-like)
-    fts_query = " & ".join(w for w in query.split() if len(w) > 2)
-    if fts_query:
+    # Use plainto_tsquery to auto-escape special characters (!, |, *, etc.)
+    fts_words = [w for w in query.split() if len(w) > 2]
+    if fts_words:
+        fts_query = " ".join(fts_words)
         fts_stmt = (
             select(Memory)
             .where(base_filter)
-            .where(text("to_tsvector('english', content) @@ to_tsquery('english', :q)"))
+            .where(text("to_tsvector('english', content) @@ plainto_tsquery('english', :q)"))
             .params(q=fts_query)
             .limit(top_k * 3)
         )
@@ -1280,6 +1282,7 @@ async def search_memories(
         entities = query_words[:10]
 
         visited_memory_ids = set()
+        hop1_memory_ids = set()
         hop1_entities = set()
 
         # Hop 1: Direct relation matches
@@ -1295,6 +1298,7 @@ async def search_memories(
             for rel in rels:
                 if rel.memory_id and rel.memory_id not in visited_memory_ids:
                     visited_memory_ids.add(rel.memory_id)
+                    hop1_memory_ids.add(rel.memory_id)
                     hop1_entities.add(rel.source_entity.lower())
                     hop1_entities.add(rel.target_entity.lower())
 
@@ -1323,7 +1327,7 @@ async def search_memories(
             graph_mems = (await db.execute(graph_stmt)).scalars().all()
             for rank, mem in enumerate(graph_mems):
                 mid = mem.id
-                is_hop2 = mid not in {r.memory_id for r in rels}  # approximate
+                is_hop2 = mid not in hop1_memory_ids
                 weight = 0.8 if is_hop2 else 1.0
                 if mid in results:
                     results[mid]["sources"].append("graph")
