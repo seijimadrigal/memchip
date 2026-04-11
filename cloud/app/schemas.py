@@ -508,3 +508,92 @@ class RecallResponse(BaseModel):
     token_count: int
     sections: dict
     latency_ms: float
+
+
+# ========== v1.1.0: Tool Traces, Consolidation, Stale Detection, Contradictions ==========
+
+class ToolCallItem(BaseModel):
+    tool: str
+    args: str
+    result_summary: Optional[str] = None
+    duration_ms: Optional[int] = None
+
+class TraceData(BaseModel):
+    task: str
+    tools_used: List[str]
+    tool_calls: List[ToolCallItem]
+    outcome: str = "success"
+    duration_ms: Optional[int] = None
+
+class ToolTraceRequest(BaseModel):
+    user_id: str
+    agent_id: Optional[str] = None
+    session_id: Optional[str] = None
+    trace: TraceData
+
+class ToolTraceResponse(BaseModel):
+    status: str = "ok"
+    trace_id: str = ""
+    memories_created: int = 0
+    counts: dict = {}
+    memory_ids: list = []
+    dedup_stats: Optional[dict] = None
+
+class ConsolidateRequest(BaseModel):
+    user_id: str
+    scope: str = "duplicates"
+    threshold: float = 0.85
+    dry_run: bool = True
+    limit: int = 100
+
+class DuplicateGroupItem(BaseModel):
+    id: str
+    content: str
+    score: float = 0.0
+
+class DuplicateGroup(BaseModel):
+    group_id: int
+    memories: list = []
+    suggested_merge: Optional[str] = None
+
+class ConsolidateResponse(BaseModel):
+    scanned: int = 0
+    duplicate_groups: list = []
+    stale_candidates: list = []
+    actions_taken: dict = {}
+
+class StaleCandidateDetail(BaseModel):
+    id: str
+    content: str
+    memory_type: str
+    decay_score: float
+    access_count: int
+    days_old: int
+    stale_reason: str
+    recommendation: str
+
+class StaleDetectionResponse(BaseModel):
+    total_stale: int = 0
+    by_reason: dict = {}
+    candidates: list = []
+
+class ContradictionCheckRequest(BaseModel):
+    user_id: str
+    text: Optional[str] = None
+    entity: Optional[str] = None
+    limit: int = 20
+
+class ContradictionMemory(BaseModel):
+    id: str
+    content: str
+
+class ContradictionPair(BaseModel):
+    memory_a: ContradictionMemory
+    memory_b: ContradictionMemory
+    confidence: float
+    reasoning: str
+    suggestion: str
+
+class ContradictionResponse(BaseModel):
+    contradictions_found: int = 0
+    pairs: list = []

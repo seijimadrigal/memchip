@@ -51,6 +51,8 @@ from app.engine import (
     # Phase 4
     batch_sync, create_memory_pool, get_pool_memories, delete_pool,
     temporal_query, graph_query,
+    # v1.1.0
+    capture_tool_trace, detect_stale_memories, consolidate_memories, detect_contradictions,
 )
 from app.models import (
     Memory, MemorySession, PoolAccess, Webhook,
@@ -1309,11 +1311,11 @@ async def api_analytics(
     growth_rows = (await db.execute(growth_q, {"org": org_id})).fetchall()
     growth_by_day = [{"day": str(r[0]), "count": r[1]} for r in growth_rows]
 
-    agent_q = sa_text("SELECT COALESCE(agent_id, 'unknown'), count(*) FROM memories WHERE org_id = :org AND status IN ('active', 'archived') GROUP BY agent_id")
+    agent_q = sa_text("SELECT COALESCE(agent_id, 'unknown'), count(*) FROM memories WHERE org_id = :org AND status = 'active' AND conflict_status = 'active' GROUP BY agent_id")
     agent_rows = (await db.execute(agent_q, {"org": org_id})).fetchall()
     agent_activity = {r[0]: r[1] for r in agent_rows}
 
-    type_q = sa_text("SELECT memory_type, count(*) FROM memories WHERE org_id = :org AND status IN ('active', 'archived') GROUP BY memory_type")
+    type_q = sa_text("SELECT memory_type, count(*) FROM memories WHERE org_id = :org AND status = 'active' AND conflict_status = 'active' GROUP BY memory_type")
     type_rows = (await db.execute(type_q, {"org": org_id})).fetchall()
     type_distribution = {r[0]: r[1] for r in type_rows}
 
@@ -1433,18 +1435,18 @@ async def api_stats(
     db: AsyncSession = Depends(get_db),
 ):
     """Dashboard summary stats."""
-    base = sa_text("SELECT count(*) FROM memories WHERE org_id = :org AND status IN ('active', 'archived')")
+    base = sa_text("SELECT count(*) FROM memories WHERE org_id = :org AND status = 'active' AND conflict_status = 'active'")
     total = (await db.execute(base, {"org": auth.org_id})).scalar() or 0
     
-    type_q = sa_text("SELECT memory_type, count(*) FROM memories WHERE org_id = :org AND status IN ('active', 'archived') GROUP BY memory_type")
+    type_q = sa_text("SELECT memory_type, count(*) FROM memories WHERE org_id = :org AND status = 'active' AND conflict_status = 'active' GROUP BY memory_type")
     type_rows = (await db.execute(type_q, {"org": auth.org_id})).fetchall()
     by_type = {r[0]: r[1] for r in type_rows}
     
-    agent_q = sa_text("SELECT COALESCE(agent_id, 'unknown'), count(*) FROM memories WHERE org_id = :org AND status IN ('active', 'archived') GROUP BY agent_id")
+    agent_q = sa_text("SELECT COALESCE(agent_id, 'unknown'), count(*) FROM memories WHERE org_id = :org AND status = 'active' AND conflict_status = 'active' GROUP BY agent_id")
     agent_rows = (await db.execute(agent_q, {"org": auth.org_id})).fetchall()
     by_agent = {r[0]: r[1] for r in agent_rows}
     
-    pool_q = sa_text("SELECT COALESCE(pool_id, 'private'), count(*) FROM memories WHERE org_id = :org AND status IN ('active', 'archived') GROUP BY pool_id")
+    pool_q = sa_text("SELECT COALESCE(pool_id, 'private'), count(*) FROM memories WHERE org_id = :org AND status = 'active' AND conflict_status = 'active' GROUP BY pool_id")
     pool_rows = (await db.execute(pool_q, {"org": auth.org_id})).fetchall()
     by_pool = {r[0]: r[1] for r in pool_rows}
     
@@ -2009,5 +2011,95 @@ async def api_graph_query(
         relationship_types=body.get("relationship_types"),
         user_id=body.get("user_id"),
         limit=body.get("limit", 50)
+    )
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# v1.1.0 — Tool Traces, Consolidation, Stale Detection, Contradictions
+# ═══════════════════════════════════════════════════════════════
+
+@app.post("/v1/traces")
+async def api_capture_trace(
+    request: Request,
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """Capture a tool execution trace for procedural auto-learning."""
+    body = await request.json()
+    trace = body.get("trace", {})
+    if not trace:
+        return {"status": "error", "trace_id": "", "memories_created": 0}
+
+    result = await capture_tool_trace(
+        db, org_id=auth.org_id,
+        user_id=body.get("user_id", "default"),
+        agent_id=body.get("agent_id"),
+        session_id=body.get("session_id"),
+        trace=trace,
+    )
+    return result
+
+
+@app.post("/v1/memories/consolidate")
+async def api_consolidate_memories(
+    request: Request,
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """Server-side memory consolidation (dream mode)."""
+    body = await request.json()
+    result = await consolidate_memories(
+        db, org_id=auth.org_id,
+        user_id=body.get("user_id", "default"),
+        scope=body.get("scope", "duplicates"),
+        threshold=body.get("threshold", 0.85),
+        dry_run=body.get("dry_run", True),
+        limit=body.get("limit", 100),
+    )
+    return result
+
+
+@app.get("/v1/memories/stale")
+async def api_stale_memories(
+    user_id: str = Query("default"),
+    threshold: float = Query(0.2),
+    min_age_days: int = Query(7),
+    limit: int = Query(50),
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """Detect stale memories with reasons and recommendations."""
+    result = await detect_stale_memories(
+        db, org_id=auth.org_id,
+        user_id=user_id,
+        threshold=threshold,
+        min_age_days=min_age_days,
+        limit=limit,
+    )
+    return result
+
+
+@app.post("/v1/memories/check-contradictions")
+async def api_check_contradictions(
+    request: Request,
+    auth: AuthContext = Depends(authenticate),
+    db: AsyncSession = Depends(get_db),
+):
+    """LLM-based contradiction detection between facts."""
+    body = await request.json()
+    user_id = body.get("user_id", "default")
+    text = body.get("text")
+    entity = body.get("entity")
+
+    if not text and not entity:
+        return {"error": "Either 'text' or 'entity' must be provided", "contradictions_found": 0, "pairs": []}
+
+    result = await detect_contradictions(
+        db, org_id=auth.org_id,
+        user_id=user_id,
+        text=text,
+        entity=entity,
+        limit=body.get("limit", 20),
     )
     return result

@@ -2263,3 +2263,362 @@ async def graph_query(
         "graph": {"nodes": nodes, "edges": edges},
         "linked_memories": memories,
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# v1.1.0 — Tool Traces, Consolidation, Stale Detection, Contradictions
+# ═══════════════════════════════════════════════════════════════
+
+async def capture_tool_trace(
+    db, org_id: str, user_id: str, agent_id: str = None,
+    session_id: str = None, trace: dict = None,
+) -> dict:
+    """Capture a tool execution trace for procedural auto-learning."""
+    if not trace:
+        return {"status": "error", "trace_id": "", "memories_created": 0, "counts": {}, "memory_ids": []}
+
+    # Build text representation for the extraction pipeline
+    steps = []
+    for i, tc in enumerate(trace.get("tool_calls", [])):
+        steps.append(f"Step {i+1}: {tc.get('tool', '?')}({tc.get('args', '')}) -> {tc.get('result_summary', 'done')}")
+
+    text = (
+        f"Tool execution trace for task: {trace.get('task', 'unknown')}\n"
+        f"Tools used: {', '.join(trace.get('tools_used', []))}\n"
+        f"Outcome: {trace.get('outcome', 'unknown')}\n"
+        f"Duration: {trace.get('duration_ms', 0)}ms\n"
+        + "\n".join(steps)
+    )
+
+    # Delegate to add_memory — gets full extraction pipeline
+    result = await add_memory(
+        db, org_id, text=text, user_id=user_id,
+        agent_id=agent_id,
+        source_type="tool_trace",
+        source_ref=session_id,
+        metadata={"trace_task": trace.get("task"), "outcome": trace.get("outcome"), "tools_count": len(trace.get("tool_calls", []))},
+    )
+
+    # Update the first memory's structured_data with full trace
+    if result.get("memory_ids"):
+        raw_id = result["memory_ids"][0]
+        raw_mem = (await db.execute(select(Memory).where(Memory.id == raw_id))).scalar_one_or_none()
+        if raw_mem:
+            raw_mem.structured_data = trace
+            await db.commit()
+
+    return {
+        "status": result.get("status", "ok"),
+        "trace_id": result["memory_ids"][0] if result.get("memory_ids") else "",
+        "memories_created": result.get("memories_created", 0),
+        "counts": result.get("counts", {}),
+        "memory_ids": result.get("memory_ids", []),
+        "dedup_stats": result.get("dedup_stats"),
+    }
+
+
+async def detect_stale_memories(
+    db, org_id: str, user_id: str,
+    threshold: float = 0.2, min_age_days: int = 7, limit: int = 50,
+) -> dict:
+    """Detect stale memories with reasons and recommendations."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=min_age_days)
+
+    stmt = select(Memory).where(
+        Memory.org_id == org_id,
+        Memory.user_id == user_id,
+        Memory.created_at < cutoff,
+        or_(
+            and_(Memory.status == "active", Memory.decay_score < threshold),
+            and_(Memory.status == "active", Memory.access_count == 0),
+            Memory.conflict_status == "superseded",
+        ),
+    ).order_by(Memory.decay_score.asc()).limit(limit)
+
+    result = await db.execute(stmt)
+    memories = result.scalars().all()
+
+    by_reason = {"low_decay": 0, "never_accessed": 0, "superseded": 0}
+    candidates = []
+
+    for mem in memories:
+        days_old = (datetime.utcnow() - mem.created_at).days if mem.created_at else 0
+
+        if mem.conflict_status == "superseded":
+            reason = "superseded"
+            recommendation = "cleanup"
+        elif (mem.access_count or 0) == 0:
+            reason = "never_accessed"
+            recommendation = "archive"
+        else:
+            reason = "low_decay"
+            recommendation = "review"
+
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        candidates.append({
+            "id": mem.id,
+            "content": (mem.content or "")[:200],
+            "memory_type": mem.memory_type or "unknown",
+            "decay_score": round(mem.decay_score or 0, 4),
+            "access_count": mem.access_count or 0,
+            "days_old": days_old,
+            "stale_reason": reason,
+            "recommendation": recommendation,
+        })
+
+    return {
+        "total_stale": len(candidates),
+        "by_reason": by_reason,
+        "candidates": candidates,
+    }
+
+
+async def consolidate_memories(
+    db, org_id: str, user_id: str,
+    scope: str = "duplicates", threshold: float = 0.85,
+    dry_run: bool = True, limit: int = 100,
+) -> dict:
+    """Server-side memory consolidation (dream mode)."""
+    result = {
+        "scanned": 0,
+        "duplicate_groups": [],
+        "stale_candidates": [],
+        "actions_taken": {"merged": 0, "archived": 0},
+    }
+
+    if scope in ("duplicates", "all"):
+        # Find active memories with embeddings
+        stmt = select(Memory).where(
+            Memory.org_id == org_id,
+            Memory.user_id == user_id,
+            Memory.status == "active",
+            Memory.conflict_status == "active",
+            Memory.embedding_vec.isnot(None),
+        ).order_by(Memory.created_at.desc()).limit(limit)
+
+        mems = (await db.execute(stmt)).scalars().all()
+        result["scanned"] = len(mems)
+
+        # Find duplicate clusters
+        processed = set()
+        group_id = 0
+
+        for mem in mems:
+            if mem.id in processed:
+                continue
+
+            # pgvector similarity search
+            try:
+                sim_stmt = (
+                    select(Memory.id, Memory.content,
+                           Memory.embedding_vec.cosine_distance(mem.embedding_vec).label("distance"))
+                    .where(
+                        Memory.org_id == org_id,
+                        Memory.user_id == user_id,
+                        Memory.status == "active",
+                        Memory.conflict_status == "active",
+                        Memory.id != mem.id,
+                        Memory.embedding_vec.isnot(None),
+                    )
+                    .order_by(Memory.embedding_vec.cosine_distance(mem.embedding_vec))
+                    .limit(5)
+                )
+                sim_results = (await db.execute(sim_stmt)).all()
+            except Exception:
+                continue
+
+            dupes = []
+            for row in sim_results:
+                sim = 1.0 - row.distance
+                if sim >= threshold and row.id not in processed:
+                    dupes.append({"id": row.id, "content": (row.content or "")[:200], "score": round(sim, 4)})
+
+            if dupes:
+                group_id += 1
+                group_mems = [{"id": mem.id, "content": (mem.content or "")[:200], "score": 1.0}] + dupes
+                processed.add(mem.id)
+                for d in dupes:
+                    processed.add(d["id"])
+
+                # Generate merge suggestion via LLM
+                suggested_merge = None
+                try:
+                    merge_texts = [mem.content or ""] + [d["content"] for d in dupes]
+                    merge_prompt = "Merge these duplicate memories into one concise, accurate entry:\n" + "\n".join(f"- {t}" for t in merge_texts)
+                    suggested_merge = call_llm(prompt=merge_prompt, provider="openrouter", model=LLM_MODEL, api_key=OPENROUTER_API_KEY)
+                except Exception:
+                    pass
+
+                group = {"group_id": group_id, "memories": group_mems, "suggested_merge": suggested_merge}
+                result["duplicate_groups"].append(group)
+
+                # Execute merge if not dry run
+                if not dry_run and suggested_merge:
+                    try:
+                        await add_memory(
+                            db, org_id, text=suggested_merge, user_id=user_id,
+                            source_type="consolidation",
+                        )
+                        # Supersede originals (except first)
+                        for d in dupes:
+                            old = (await db.execute(select(Memory).where(Memory.id == d["id"]))).scalar_one_or_none()
+                            if old:
+                                old.conflict_status = "superseded"
+                        await db.commit()
+                        result["actions_taken"]["merged"] += 1
+                    except Exception:
+                        await db.rollback()
+
+    if scope in ("stale", "all"):
+        stale_result = await detect_stale_memories(db, org_id, user_id, threshold=0.2, min_age_days=7, limit=limit)
+        result["stale_candidates"] = stale_result.get("candidates", [])
+
+        if not dry_run:
+            for candidate in result["stale_candidates"]:
+                if candidate["recommendation"] in ("archive", "cleanup"):
+                    try:
+                        mem = (await db.execute(select(Memory).where(Memory.id == candidate["id"]))).scalar_one_or_none()
+                        if mem:
+                            mem.status = "archived"
+                            result["actions_taken"]["archived"] += 1
+                    except Exception:
+                        continue
+            await db.commit()
+
+    return result
+
+
+async def detect_contradictions(
+    db, org_id: str, user_id: str,
+    text: str = None, entity: str = None, limit: int = 20,
+) -> dict:
+    """LLM-based contradiction detection between facts."""
+    import re, json as json_mod
+
+    pairs = []
+
+    if text:
+        # Search for similar memories to check against
+        try:
+            query_vec = embed_query_vec(text[:512])
+            stmt = (
+                select(Memory.id, Memory.content, Memory.created_at,
+                       Memory.embedding_vec.cosine_distance(query_vec).label("distance"))
+                .where(
+                    Memory.org_id == org_id,
+                    Memory.user_id == user_id,
+                    Memory.status == "active",
+                    Memory.conflict_status == "active",
+                    Memory.embedding_vec.isnot(None),
+                )
+                .order_by(Memory.embedding_vec.cosine_distance(query_vec))
+                .limit(limit)
+            )
+            results = (await db.execute(stmt)).all()
+            similar = [r for r in results if (1.0 - r.distance) > 0.3]
+        except Exception:
+            similar = []
+
+        if similar:
+            facts_text = "\n".join(f"[{i+1}] {r.content[:300]}" for i, r in enumerate(similar))
+            prompt = (
+                f'Given this new statement:\n"{text}"\n\n'
+                f"And these existing facts:\n{facts_text}\n\n"
+                "Identify contradictions between the new statement and existing facts. "
+                "Return a JSON array of objects: [{\"fact_index\": int, \"confidence\": 0-1, \"reasoning\": str, \"suggestion\": \"supersede_older\"|\"keep_both\"|\"review\"}]. "
+                "If no contradictions, return []."
+            )
+            try:
+                response = call_llm(prompt=prompt, provider="openrouter", model=LLM_MODEL, api_key=OPENROUTER_API_KEY)
+                match = re.search(r"\[.*\]", response, re.DOTALL)
+                if match:
+                    parsed = json_mod.loads(match.group())
+                    for item in parsed:
+                        idx = item.get("fact_index", 1) - 1
+                        if 0 <= idx < len(similar):
+                            pairs.append({
+                                "memory_a": {"id": similar[idx].id, "content": similar[idx].content[:300]},
+                                "memory_b": {"id": "new_input", "content": text[:300]},
+                                "confidence": item.get("confidence", 0.5),
+                                "reasoning": item.get("reasoning", ""),
+                                "suggestion": item.get("suggestion", "review"),
+                            })
+            except Exception:
+                pass
+
+    elif entity:
+        # Find all memories about this entity
+        from app.models import Relation
+
+        # Via relations
+        rel_stmt = select(Relation).where(
+            Relation.org_id == org_id,
+            Relation.user_id == user_id,
+            or_(
+                Relation.source_entity.ilike(f"%{entity}%"),
+                Relation.target_entity.ilike(f"%{entity}%"),
+            )
+        ).limit(limit * 2)
+        rels = (await db.execute(rel_stmt)).scalars().all()
+        mem_ids = list(set(r.memory_id for r in rels if r.memory_id))
+
+        # Also via content search
+        try:
+            entity_vec = embed_query_vec(entity)
+            vec_stmt = (
+                select(Memory.id)
+                .where(
+                    Memory.org_id == org_id,
+                    Memory.user_id == user_id,
+                    Memory.status == "active",
+                    Memory.embedding_vec.isnot(None),
+                )
+                .order_by(Memory.embedding_vec.cosine_distance(entity_vec))
+                .limit(limit)
+            )
+            vec_results = (await db.execute(vec_stmt)).all()
+            for r in vec_results:
+                if r.id not in mem_ids:
+                    mem_ids.append(r.id)
+        except Exception:
+            pass
+
+        if mem_ids:
+            mems_stmt = select(Memory).where(
+                Memory.id.in_(mem_ids[:limit]),
+                Memory.status == "active",
+            )
+            entity_mems = (await db.execute(mems_stmt)).scalars().all()
+
+            if len(entity_mems) >= 2:
+                facts_text = "\n".join(f"[{i+1}] (id:{m.id[:8]}) {m.content[:300]}" for i, m in enumerate(entity_mems))
+                prompt = (
+                    f"Given these facts about '{entity}':\n{facts_text}\n\n"
+                    "Identify contradictions between these facts. "
+                    "Return a JSON array: [{\"index_a\": int, \"index_b\": int, \"confidence\": 0-1, \"reasoning\": str, \"suggestion\": \"supersede_older\"|\"supersede_newer\"|\"keep_both\"|\"review\"}]. "
+                    "If no contradictions, return []."
+                )
+                try:
+                    response = call_llm(prompt=prompt, provider="openrouter", model=LLM_MODEL, api_key=OPENROUTER_API_KEY)
+                    match = re.search(r"\[.*\]", response, re.DOTALL)
+                    if match:
+                        parsed = json_mod.loads(match.group())
+                        for item in parsed:
+                            ia = item.get("index_a", 1) - 1
+                            ib = item.get("index_b", 1) - 1
+                            if 0 <= ia < len(entity_mems) and 0 <= ib < len(entity_mems):
+                                pairs.append({
+                                    "memory_a": {"id": entity_mems[ia].id, "content": entity_mems[ia].content[:300]},
+                                    "memory_b": {"id": entity_mems[ib].id, "content": entity_mems[ib].content[:300]},
+                                    "confidence": item.get("confidence", 0.5),
+                                    "reasoning": item.get("reasoning", ""),
+                                    "suggestion": item.get("suggestion", "review"),
+                                })
+                except Exception:
+                    pass
+
+    return {
+        "contradictions_found": len(pairs),
+        "pairs": pairs,
+    }
